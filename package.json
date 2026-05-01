@@ -1,0 +1,14 @@
+{
+  "name": "autoresearch-copilot-cli",
+  "version": "0.1.0",
+  "description": "Copilot CLI extension for autonomous research session management",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "check": "node --check .github/extensions/autoresearch/extension.mjs",
+    "test": "node scripts/smoke-test.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

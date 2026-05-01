@@ -1,0 +1,9 @@
+# autoresearch runtime state (not committed)
+.autoresearch/
+autoresearch.jsonl
+autoresearch.md
+autoresearch-export.json
+
+# Scratch/temp
+*.log
+node_modules/
