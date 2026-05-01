@@ -7,13 +7,15 @@
  */
 
 import { joinSession } from "@github/copilot-sdk/extension";
-import { execFile } from "node:child_process";
-import { writeFileSync, appendFileSync } from "node:fs";
+import { exec, execFile } from "node:child_process";
+import { existsSync, readFileSync, writeFileSync, appendFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 import { StateManager } from "./lib/state.mjs";
+import { DashboardServer, DEFAULT_PORT, buildExportHTML } from "./lib/server.mjs";
 
 const execFileAsync = promisify(execFile);
+const execAsync = promisify(exec);
 
 // ─── Paths ────────────────────────────────────────────────────────────────────
 
@@ -23,6 +25,24 @@ const LOG_FILE = join(CWD, "autoresearch.jsonl");
 const MD_FILE = join(CWD, "autoresearch.md");
 
 const stateMgr = new StateManager(STATE_DIR);
+
+// ─── Dashboard server (lazy-started) ─────────────────────────────────────────
+
+const dashboard = new DashboardServer(stateMgr, DEFAULT_PORT);
+let dashboardUrl = null;
+
+async function ensureDashboard() {
+  if (!dashboardUrl) {
+    try {
+      dashboardUrl = await dashboard.start();
+    } catch (err) {
+      // Port may already be in use — record URL anyway
+      dashboardUrl = `http://127.0.0.1:${DEFAULT_PORT}`;
+      appendLog({ event: "dashboard_start_error", error: err.message });
+    }
+  }
+  return dashboardUrl;
+}
 
 // ─── State helpers (thin wrappers over StateManager) ─────────────────────────
 
@@ -83,24 +103,35 @@ function parseMetrics(text) {
 
 /**
  * Run a shell command cross-platform.
+ *
+ * On Windows we use exec() which spawns cmd.exe, letting PowerShell, npm.cmd,
+ * npx.cmd, and other .cmd wrappers resolve correctly. On POSIX we use execFile
+ * with sh (or $SHELL) directly for cleaner arg escaping.
+ *
  * @param {string} command
  * @param {{ cwd?: string, timeoutMs?: number }} [opts]
  * @returns {Promise<{ok: boolean, stdout: string, stderr: string, exitCode: number}>}
  */
 async function runShell(command, opts = {}) {
   const isWindows = process.platform === "win32";
-  const shell = isWindows ? "powershell" : (process.env.SHELL || "sh");
-  const shellArgs = isWindows
-    ? ["-NoProfile", "-NonInteractive", "-Command", command]
-    : ["-c", command];
+  const runOpts = {
+    cwd: opts.cwd || CWD,
+    timeout: opts.timeoutMs || 30_000,
+    maxBuffer: 2 * 1024 * 1024,
+  };
 
   try {
-    const { stdout, stderr } = await execFileAsync(shell, shellArgs, {
-      cwd: opts.cwd || CWD,
-      timeout: opts.timeoutMs || 30_000,
-      maxBuffer: 2 * 1024 * 1024,
-    });
-    return { ok: true, stdout: stdout || "", stderr: stderr || "", exitCode: 0 };
+    if (isWindows) {
+      // exec() uses CreateProcess with cmd.exe; resolves npm.cmd, npx.cmd, etc.
+      // Wrap in PowerShell so the user can write PS idioms, but via exec shell:
+      const psCmd = `powershell -NoProfile -NonInteractive -Command "${command.replace(/"/g, '\\"')}"`;
+      const { stdout, stderr } = await execAsync(psCmd, runOpts);
+      return { ok: true, stdout: stdout || "", stderr: stderr || "", exitCode: 0 };
+    } else {
+      const shell = process.env.SHELL || "sh";
+      const { stdout, stderr } = await execFileAsync(shell, ["-c", command], runOpts);
+      return { ok: true, stdout: stdout || "", stderr: stderr || "", exitCode: 0 };
+    }
   } catch (err) {
     return {
       ok: false,
@@ -190,18 +221,20 @@ function updateMarkdownSummary(state) {
 const HELP_TEXT = `autoresearch — autonomous research session manager
 
 Subcommands (use as /autoresearch <sub>):
-  help     Show this help
-  init     Initialise a new research session in .autoresearch/
-  status   Print current session status and metrics
-  run      Execute the configured research command
-  log      Show recent JSONL log entries
-  export   Write a full snapshot to autoresearch-export.json
-  server   Show server info / check daemon status
-  pause    Pause the active research run
-  resume   Resume a paused research run
+  help      Show this help
+  init      Initialise a new research session in .autoresearch/
+  status    Print current session status and metrics
+  run       Execute a research command (remainder of args is the command)
+  log       Show recent JSONL log entries
+  export    Write a full JSON snapshot to autoresearch-export.json
+  server    Show extension server info (pid, cwd, status)
+  dashboard Start or return the live web dashboard URL
+  pause     Pause the active research run
+  resume    Resume a paused research run
 
 Tools registered: autoresearch_init, autoresearch_status, autoresearch_run,
-  autoresearch_log, autoresearch_export, autoresearch_server`;
+  autoresearch_log, autoresearch_export, autoresearch_server,
+  autoresearch_dashboard, autoresearch_export_html`;
 
 // ─── Join session ─────────────────────────────────────────────────────────────
 
@@ -298,6 +331,12 @@ const session = await joinSession({
           return;
         }
 
+        if (sub === "dashboard") {
+          const url = await ensureDashboard();
+          await session.log(`AutoResearch dashboard: ${url}`);
+          return;
+        }
+
         if (sub === "pause") {
           const state = readState();
           if (state.status === "running") {
@@ -359,7 +398,22 @@ const session = await joinSession({
             textResultForLlm: `Session already initialised (status: ${state.status}). No changes made.`,
           };
         }
-        const goal = args?.label || args?.goal || undefined;
+
+        // If the agent didn't supply a goal but UI elicitation is available, ask the user.
+        let goal = args?.label || args?.goal || undefined;
+        if (!goal && session.capabilities.ui?.elicitation) {
+          try {
+            const result = await session.ui.input("Research goal for this session?", {
+              title: "autoresearch — session goal",
+              description: "Describe what you are trying to optimise or discover.",
+              maxLength: 200,
+            });
+            if (result) goal = result;
+          } catch {
+            // elicitation not available in this host — silently skip
+          }
+        }
+
         stateMgr.startSession(goal, args?.benchmark_command || undefined);
         appendLog({ event: "init", goal, cwd: CWD });
         updateMarkdownSummary(readState());
@@ -575,6 +629,7 @@ const session = await joinSession({
           stateDir: STATE_DIR,
           logFile: LOG_FILE,
           summaryFile: MD_FILE,
+          dashboardUrl: dashboardUrl || `http://127.0.0.1:${DEFAULT_PORT} (not started yet — call autoresearch_dashboard)`,
         };
         return {
           resultType: "success",
@@ -582,12 +637,198 @@ const session = await joinSession({
         };
       },
     },
+
+    // autoresearch_dashboard
+    {
+      name: "autoresearch_dashboard",
+      description:
+        "Start the live localhost web dashboard (http://127.0.0.1:7432) and return its URL. " +
+        "The dashboard displays real-time session status, goal, benchmark command, " +
+        "metric history chart, experiments table, log tail, best metric, and pause/resume controls. " +
+        "It uses Server-Sent Events for live updates with no external dependencies. " +
+        "Endpoints: GET / (UI), GET /api/state (JSON), GET /api/events (SSE stream), " +
+        "POST /api/pause, POST /api/resume, GET /api/export (static HTML snapshot).",
+      parameters: { type: "object", properties: {}, required: [] },
+      handler: async () => {
+        const url = await ensureDashboard();
+        await session.log(`AutoResearch dashboard: ${url}`, { ephemeral: true });
+        return {
+          resultType: "success",
+          textResultForLlm:
+            `Dashboard URL: ${url}\n` +
+            `Endpoints:\n` +
+            `  ${url}/            — live SPA dashboard\n` +
+            `  ${url}/api/state   — current state JSON\n` +
+            `  ${url}/api/events  — SSE event stream\n` +
+            `  ${url}/api/export  — static HTML snapshot download\n` +
+            `  POST ${url}/api/pause  — pause session\n` +
+            `  POST ${url}/api/resume — resume session`,
+        };
+      },
+    },
+
+    // autoresearch_export_html
+    {
+      name: "autoresearch_export_html",
+      description:
+        "Export a self-contained static HTML snapshot of the current session " +
+        "(experiments, metrics, logs, best metric) to a file. " +
+        "The HTML embeds all data and requires no server to view. " +
+        "Also available at GET /api/export on the running dashboard.",
+      parameters: {
+        type: "object",
+        properties: {
+          output_path: {
+            type: "string",
+            description: "Output path for the HTML file (default: .autoresearch/snapshot.html).",
+          },
+        },
+        required: [],
+      },
+      handler: async (args) => {
+        const outPath = args?.output_path
+          ? resolve(args.output_path)
+          : join(STATE_DIR, "snapshot.html");
+        const state = readState();
+        const html = buildExportHTML(state);
+        try {
+          writeFileSync(outPath, html, "utf-8");
+        } catch (err) {
+          return { resultType: "failure", textResultForLlm: `Failed to write HTML: ${err.message}` };
+        }
+        appendLog({ event: "export_html", path: outPath });
+        await session.log(`HTML snapshot exported to ${outPath}`);
+        return {
+          resultType: "success",
+          textResultForLlm: `HTML snapshot written to ${outPath} (${html.length.toLocaleString()} bytes).`,
+        };
+      },
+    },
   ],
 
   // ── Session hooks ──────────────────────────────────────────────────────────
   hooks: {
-    onSessionStart: async () => {
-      await session.log("autoresearch extension loaded", { ephemeral: true });
+    onSessionStart: async (input) => {
+      const url = await ensureDashboard();
+      await session.log(
+        `autoresearch extension loaded (source: ${input.source}) — dashboard: ${url}`,
+        { ephemeral: true }
+      );
+      return {
+        additionalContext:
+          "The autoresearch extension is active. " +
+          "Tools available: autoresearch_init (start session), autoresearch_run (execute experiments), " +
+          "autoresearch_status (check progress), autoresearch_dashboard (live web UI at " + url + "), " +
+          "autoresearch_log (JSONL entries), autoresearch_export (JSON snapshot), " +
+          "autoresearch_export_html (HTML snapshot), autoresearch_server (pause/resume/info). " +
+          "METRIC name=value lines in any stdout are automatically captured.",
+      };
+    },
+
+    onSessionEnd: async (input) => {
+      // Flush final state snapshot so nothing is lost.
+      try {
+        const s = readState();
+        if (s.status !== "idle") {
+          updateMarkdownSummary(s);
+          appendLog({ event: "session_end", reason: input.reason });
+        }
+      } catch {
+        // best-effort during teardown
+      }
+      try { await dashboard.stop(); } catch { /* already stopped */ }
+    },
+
+    onPreToolUse: async (input) => {
+      // Block destructive git/fs commands when no session is active.
+      if (input.toolName === "bash" || input.toolName === "shell") {
+        const cmd = String(input.toolArgs?.command || "");
+        const DESTRUCTIVE = /git\s+reset\s+--hard|git\s+clean\s+-[a-zA-Z]*f|rm\s+-rf\s+\//i;
+        if (DESTRUCTIVE.test(cmd)) {
+          const state = readState();
+          if (state.status === "idle") {
+            return {
+              permissionDecision: "deny",
+              permissionDecisionReason:
+                "Destructive command blocked: autoresearch session not initialised. " +
+                "Call autoresearch_init first, or run the command manually.",
+            };
+          }
+          await session.log(
+            `⚠ Destructive command in active session: ${cmd.slice(0, 120)}`,
+            { level: "warning" }
+          );
+        }
+      }
+    },
+
+    onPostToolUse: async (input) => {
+      // Harvest METRIC lines from any successful bash/shell output.
+      if (
+        (input.toolName === "bash" || input.toolName === "shell") &&
+        input.toolResult?.resultType === "success"
+      ) {
+        const out = String(input.toolResult?.textResultForLlm || "");
+        const metrics = parseMetrics(out);
+        if (Object.keys(metrics).length) {
+          const label = `agent_${Date.now()}`;
+          for (const [k, v] of Object.entries(metrics)) {
+            stateMgr.addMetric(`${label}/${k}`, v);
+          }
+          appendLog({ event: "metrics_from_agent_tool", tool: input.toolName, metrics });
+          await session.log(
+            `autoresearch captured ${Object.keys(metrics).length} metric(s) from agent ${input.toolName} output`,
+            { ephemeral: true }
+          );
+          return {
+            additionalContext: `Captured metrics: ${JSON.stringify(metrics)}`,
+          };
+        }
+      }
+    },
+
+    onErrorOccurred: async (input) => {
+      try {
+        appendLog({
+          event: "error",
+          context: input.errorContext,
+          error: input.error,
+          recoverable: input.recoverable,
+        });
+      } catch { /* don't throw inside error handler */ }
+      // Retry transient model call failures once; abort everything else.
+      if (input.recoverable && input.errorContext === "model_call") {
+        return { errorHandling: "retry", retryCount: 1 };
+      }
     },
   },
+});
+
+// ── Session event subscriptions ──────────────────────────────────────────────
+
+// Log when the agent's assistant message lands (non-ephemeral timeline entry).
+session.on("assistant.message", (event) => {
+  try {
+    const content = event.data?.content;
+    if (content) {
+      // Harvest any METRIC lines the agent itself may have emitted in its response.
+      const metrics = parseMetrics(content);
+      if (Object.keys(metrics).length) {
+        const label = `assistant_${Date.now()}`;
+        for (const [k, v] of Object.entries(metrics)) {
+          stateMgr.addMetric(`${label}/${k}`, v);
+        }
+        appendLog({ event: "metrics_from_assistant", metrics });
+      }
+    }
+  } catch { /* never throw in an event listener */ }
+});
+
+// Persist on shutdown so the last state is always flushed.
+session.on("session.shutdown", () => {
+  try {
+    const s = readState();
+    if (s.status !== "idle") updateMarkdownSummary(s);
+    appendLog({ event: "shutdown" });
+  } catch { /* best-effort */ }
 });
