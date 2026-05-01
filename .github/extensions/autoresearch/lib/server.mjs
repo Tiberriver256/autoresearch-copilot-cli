@@ -1,15 +1,28 @@
 /**
  * DashboardServer — a zero-dependency localhost HTTP server that serves:
- *   GET  /              → live dashboard SPA (SSE-powered)
- *   GET  /api/state     → current state as JSON
- *   GET  /api/events    → SSE stream of state changes
- *   POST /api/pause     → pause the session (safe, non-destructive)
- *   POST /api/resume    → resume the session (safe, non-destructive)
- *   GET  /api/export    → static HTML snapshot (no live features)
+ *   GET  /               → live dashboard SPA (SSE-powered)
+ *   GET  /api/state      → current state as JSON
+ *   GET  /api/events     → SSE stream: state changes + named Copilot CLI session events
+ *   GET  /api/activity   → recent Copilot CLI session events as JSON array
+ *   POST /api/pause      → pause the session (safe, non-destructive)
+ *   POST /api/resume     → resume the session (safe, non-destructive)
+ *   GET  /api/export     → static HTML snapshot (no live features)
+ *
+ * Transport choice — SSE over WebSocket:
+ *   Node.js has no built-in WebSocket *server* (only a client since v21).
+ *   Implementing one from scratch requires manual SHA-1 handshake + frame
+ *   codec — ~150 lines of fiddly code — and introduces the 'ws' package if
+ *   we want reliability. SSE is a first-class HTTP feature, works over plain
+ *   http.createServer(), supports named events and auto-reconnect natively,
+ *   and is sufficient here because all dashboard control actions (pause/resume)
+ *   use regular fetch() POSTs. Zero extra dependencies needed.
  */
 import { createServer } from 'node:http';
 
 export const DEFAULT_PORT = 7432;
+
+/** Maximum number of Copilot CLI session events to keep in memory for replay. */
+const MAX_ACTIVITY = 100;
 
 export class DashboardServer {
   /** @param {import('./state.mjs').StateManager} sm */
@@ -17,9 +30,14 @@ export class DashboardServer {
     this.sm = sm;
     this.port = port;
     this.clients = new Set();
+    /** Ring buffer of Copilot CLI session events, replayed to new SSE connections. */
+    this.copilotEvents = [];
     this.server = null;
     this._onChange = (state) => this._broadcast(state);
   }
+
+  /** Number of currently connected SSE clients. */
+  get activeClients() { return this.clients.size; }
 
   /** Starts the server. Returns the URL string. */
   start() {
@@ -64,6 +82,29 @@ export class DashboardServer {
     }
   }
 
+  /**
+   * Push a named Copilot CLI session event to all connected SSE clients and
+   * buffer it so it is replayed to clients that connect later.
+   *
+   * Called by extension.mjs to bridge session.on() listeners and hook return
+   * values to the dashboard without any additional transport layer.
+   *
+   * Browsers receive this as: es.addEventListener('copilot', handler)
+   *
+   * @param {string} name   Logical event type, e.g. 'tool.start', 'assistant.message'
+   * @param {object} [data] Arbitrary serialisable payload
+   */
+  broadcastEvent(name, data = {}) {
+    const entry = { ts: new Date().toISOString(), type: name, ...data };
+    this.copilotEvents.push(entry);
+    if (this.copilotEvents.length > MAX_ACTIVITY) this.copilotEvents.shift();
+    const payload = `event: copilot\ndata: ${JSON.stringify(entry)}\n\n`;
+    for (const res of this.clients) {
+      try { res.write(payload); }
+      catch { this.clients.delete(res); }
+    }
+  }
+
   _route(req, res) {
     const url = new URL(req.url, `http://127.0.0.1:${this.port}`);
     const p = url.pathname;
@@ -93,8 +134,18 @@ export class DashboardServer {
       res.write('retry: 2000\n\n');
       // Send current state immediately so page renders without waiting for a change
       res.write(`data: ${JSON.stringify(this.sm.getState())}\n\n`);
+      // Replay buffered Copilot CLI session events so a freshly opened tab
+      // can reconstruct the agent activity feed without missing history.
+      for (const ev of this.copilotEvents) {
+        res.write(`event: copilot\ndata: ${JSON.stringify(ev)}\n\n`);
+      }
       this.clients.add(res);
       req.on('close', () => this.clients.delete(res));
+
+    } else if (req.method === 'GET' && p === '/api/activity') {
+      // Recent Copilot CLI session events as JSON — useful for scripting/polling.
+      res.writeHead(200, { 'Content-Type': 'application/json', 'Cache-Control': 'no-store' });
+      res.end(JSON.stringify(this.copilotEvents));
 
     } else if (req.method === 'POST' && p === '/api/pause') {
       this.sm.pause();
@@ -245,6 +296,11 @@ button:disabled{opacity:.4;cursor:not-allowed}
   <div class="card">
     <h2>Logs <span id="log-count" style="font-weight:400;color:#484f58"></span></h2>
     <div id="log-box" class="log-box"></div>
+  </div>
+
+  <div class="card">
+    <h2>Agent Activity <span id="activity-count" style="font-weight:400;color:#484f58"></span></h2>
+    <div id="activity-box" class="log-box"></div>
   </div>
 </div>
 
@@ -399,6 +455,63 @@ async function doAction(action) {
   } catch (e) {
     console.error(e);
   }
+}
+
+// ── Agent Activity feed (Copilot CLI session events via SSE named events) ────────
+
+const activityLog = [];
+
+/**
+ * Colour map for Copilot CLI session event types.
+ * The extension bridges session.on() and hook callbacks to this SSE channel.
+ */
+const ACTIVITY_COLORS = {
+  'tool.start':           '#79c0ff',
+  'tool.end':             '#56d364',
+  'tool.denied':          '#f85149',
+  'tool.metrics':         '#e3b341',
+  'assistant.message':    '#e6edf3',
+  'session.start':        '#56d364',
+  'session.end':          '#8b949e',
+  'session.shutdown':     '#8b949e',
+  'error':                '#f85149',
+};
+
+function renderActivity(events) {
+  const box = document.getElementById('activity-box');
+  document.getElementById('activity-count').textContent = '(' + events.length + ')';
+  const wasBottom = box.scrollTop + box.clientHeight >= box.scrollHeight - 10;
+  box.innerHTML = events.slice(0, 80).map(ev => {
+    const col = ACTIVITY_COLORS[ev.type] || '#8b949e';
+    let body;
+    if (ev.content)   body = esc(ev.content.slice(0, 300));
+    else if (ev.toolName) body = esc(ev.toolName) + (ev.command ? ': ' + esc(String(ev.command).slice(0, 100)) : '');
+    else if (ev.error)    body = esc(String(ev.error).slice(0, 200));
+    else                  body = esc(JSON.stringify(ev).slice(0, 200));
+    return '<div style="margin-bottom:3px">' +
+      '<span class="log-time">' + fmtShort(ev.ts) + '</span>' +
+      '<span style="color:' + col + '">[' + esc(ev.type) + ']</span> ' +
+      '<span style="color:#8b949e">' + body + '</span></div>';
+  }).join('') || '<div class="empty">No agent activity yet</div>';
+  if (wasBottom) box.scrollTop = box.scrollHeight;
+}
+
+// SSE connection — receives both default state messages and named 'copilot' events.
+function connect() {
+  const es = new EventSource('/api/events');
+  document.getElementById('sse-dot').className = 'sse-dot';
+  es.onopen  = () => document.getElementById('sse-dot').className = 'sse-dot live';
+  es.onmessage = (e) => { state = JSON.parse(e.data); render(state); };
+  es.onerror  = () => { document.getElementById('sse-dot').className = 'sse-dot'; };
+
+  // Named 'copilot' events: Copilot CLI session.on() + hook callbacks bridged
+  // by the extension process. New connections receive a replay of the buffer.
+  es.addEventListener('copilot', (e) => {
+    const ev = JSON.parse(e.data);
+    activityLog.unshift(ev);
+    if (activityLog.length > 100) activityLog.pop();
+    renderActivity(activityLog);
+  });
 }
 
 connect();

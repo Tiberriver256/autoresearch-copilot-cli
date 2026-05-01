@@ -327,7 +327,15 @@ const session = await joinSession({
 
         if (sub === "server") {
           const state = readState();
-          await session.log(`Server info:\n  cwd: ${CWD}\n  status: ${state.status || "idle"}\n  pid: ${process.pid}`);
+          const url = dashboardUrl || "(dashboard not started — use /autoresearch dashboard)";
+          await session.log(
+            `Server info:\n` +
+            `  cwd: ${CWD}\n` +
+            `  pid: ${process.pid}\n` +
+            `  status: ${state.status || "idle"}\n` +
+            `  dashboard: ${url}\n` +
+            `  active SSE clients: ${dashboard.activeClients}`
+          );
           return;
         }
 
@@ -629,7 +637,9 @@ const session = await joinSession({
           stateDir: STATE_DIR,
           logFile: LOG_FILE,
           summaryFile: MD_FILE,
-          dashboardUrl: dashboardUrl || `http://127.0.0.1:${DEFAULT_PORT} (not started yet — call autoresearch_dashboard)`,
+          dashboardUrl: dashboardUrl || `http://127.0.0.1:${DEFAULT_PORT} (not started — call autoresearch_dashboard)`,
+          dashboardActiveClients: dashboard.activeClients,
+          dashboardActivityBuffered: dashboard.copilotEvents.length,
         };
         return {
           resultType: "success",
@@ -644,9 +654,11 @@ const session = await joinSession({
       description:
         "Start the live localhost web dashboard (http://127.0.0.1:7432) and return its URL. " +
         "The dashboard displays real-time session status, goal, benchmark command, " +
-        "metric history chart, experiments table, log tail, best metric, and pause/resume controls. " +
-        "It uses Server-Sent Events for live updates with no external dependencies. " +
+        "metric history chart, experiments table, log tail, best metric, pause/resume controls, " +
+        "and a live Agent Activity feed bridged from Copilot CLI session events. " +
+        "Uses Server-Sent Events (SSE) for all live updates — zero extra dependencies. " +
         "Endpoints: GET / (UI), GET /api/state (JSON), GET /api/events (SSE stream), " +
+        "GET /api/activity (recent agent events JSON), " +
         "POST /api/pause, POST /api/resume, GET /api/export (static HTML snapshot).",
       parameters: { type: "object", properties: {}, required: [] },
       handler: async () => {
@@ -657,12 +669,14 @@ const session = await joinSession({
           textResultForLlm:
             `Dashboard URL: ${url}\n` +
             `Endpoints:\n` +
-            `  ${url}/            — live SPA dashboard\n` +
-            `  ${url}/api/state   — current state JSON\n` +
-            `  ${url}/api/events  — SSE event stream\n` +
-            `  ${url}/api/export  — static HTML snapshot download\n` +
+            `  ${url}/               — live SPA dashboard (SSE-powered)\n` +
+            `  ${url}/api/state      — current state JSON\n` +
+            `  ${url}/api/events     — SSE stream (state + named 'copilot' events)\n` +
+            `  ${url}/api/activity   — recent agent activity events JSON\n` +
+            `  ${url}/api/export     — static HTML snapshot download\n` +
             `  POST ${url}/api/pause  — pause session\n` +
-            `  POST ${url}/api/resume — resume session`,
+            `  POST ${url}/api/resume — resume session\n` +
+            `Active SSE clients: ${dashboard.activeClients}`,
         };
       },
     },
@@ -710,6 +724,7 @@ const session = await joinSession({
   hooks: {
     onSessionStart: async (input) => {
       const url = await ensureDashboard();
+      dashboard.broadcastEvent('session.start', { source: input.source, dashboardUrl: url });
       await session.log(
         `autoresearch extension loaded (source: ${input.source}) — dashboard: ${url}`,
         { ephemeral: true }
@@ -726,6 +741,7 @@ const session = await joinSession({
     },
 
     onSessionEnd: async (input) => {
+      dashboard.broadcastEvent('session.end', { reason: input.reason });
       // Flush final state snapshot so nothing is lost.
       try {
         const s = readState();
@@ -740,6 +756,12 @@ const session = await joinSession({
     },
 
     onPreToolUse: async (input) => {
+      // Notify the dashboard activity feed of the pending tool call.
+      dashboard.broadcastEvent('tool.start', {
+        toolName: input.toolName,
+        command: input.toolArgs?.command,
+      });
+
       // Block destructive git/fs commands when no session is active.
       if (input.toolName === "bash" || input.toolName === "shell") {
         const cmd = String(input.toolArgs?.command || "");
@@ -747,6 +769,7 @@ const session = await joinSession({
         if (DESTRUCTIVE.test(cmd)) {
           const state = readState();
           if (state.status === "idle") {
+            dashboard.broadcastEvent('tool.denied', { toolName: input.toolName, command: cmd.slice(0, 200) });
             return {
               permissionDecision: "deny",
               permissionDecisionReason:
@@ -763,6 +786,13 @@ const session = await joinSession({
     },
 
     onPostToolUse: async (input) => {
+      // Always notify the dashboard that the tool call completed.
+      dashboard.broadcastEvent('tool.end', {
+        toolName: input.toolName,
+        ok: input.toolResult?.resultType !== "failure",
+        resultType: input.toolResult?.resultType,
+      });
+
       // Harvest METRIC lines from any successful bash/shell output.
       if (
         (input.toolName === "bash" || input.toolName === "shell") &&
@@ -776,6 +806,7 @@ const session = await joinSession({
             stateMgr.addMetric(`${label}/${k}`, v);
           }
           appendLog({ event: "metrics_from_agent_tool", tool: input.toolName, metrics });
+          dashboard.broadcastEvent('tool.metrics', { toolName: input.toolName, metrics });
           await session.log(
             `autoresearch captured ${Object.keys(metrics).length} metric(s) from agent ${input.toolName} output`,
             { ephemeral: true }
@@ -788,6 +819,11 @@ const session = await joinSession({
     },
 
     onErrorOccurred: async (input) => {
+      dashboard.broadcastEvent('error', {
+        context: input.errorContext,
+        error: String(input.error).slice(0, 300),
+        recoverable: input.recoverable,
+      });
       try {
         appendLog({
           event: "error",
@@ -805,11 +841,22 @@ const session = await joinSession({
 });
 
 // ── Session event subscriptions ──────────────────────────────────────────────
+//
+// These bridge Copilot CLI session.on() events to the dashboard SSE activity
+// feed via dashboard.broadcastEvent(). The dashboard listens as:
+//   es.addEventListener('copilot', handler)
+// No separate transport layer is needed because extension.mjs and the HTTP
+// server run in the same Node.js process.
 
-// Log when the agent's assistant message lands (non-ephemeral timeline entry).
+// Bridge assistant messages: surface content in the activity feed and harvest
+// any METRIC name=value lines the agent may have written in its response.
 session.on("assistant.message", (event) => {
   try {
     const content = event.data?.content;
+    // Truncate to 500 chars to keep the dashboard readable.
+    dashboard.broadcastEvent('assistant.message', {
+      content: typeof content === 'string' ? content.slice(0, 500) : undefined,
+    });
     if (content) {
       // Harvest any METRIC lines the agent itself may have emitted in its response.
       const metrics = parseMetrics(content);
@@ -827,6 +874,7 @@ session.on("assistant.message", (event) => {
 // Persist on shutdown so the last state is always flushed.
 session.on("session.shutdown", () => {
   try {
+    dashboard.broadcastEvent('session.shutdown', {});
     const s = readState();
     if (s.status !== "idle") updateMarkdownSummary(s);
     appendLog({ event: "shutdown" });
