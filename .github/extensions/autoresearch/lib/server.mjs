@@ -208,10 +208,12 @@ h2{font-size:.7rem;text-transform:uppercase;letter-spacing:.1em;border-bottom:1p
 .dot{display:inline-block;width:.5rem;height:.5rem;border:1px solid currentColor;border-radius:50%;vertical-align:middle}
 .dot.live{background:var(--a);border-color:var(--a)}
 .cards{display:grid;grid-template-columns:repeat(auto-fill,minmax(190px,1fr));gap:.6rem;margin-bottom:1rem}
-.card{border:1px solid color-mix(in srgb,var(--a) 30%,transparent);padding:.55rem .7rem}
+.card{border:1px solid color-mix(in srgb,var(--a) 30%,transparent);padding:.55rem .7rem;min-width:0}
 .lbl{font-size:.65rem;text-transform:uppercase;letter-spacing:.09em;opacity:.5;margin-bottom:.1rem}
 .big{font:1.25rem/1.2 monospace;font-weight:600}
 .sub{font-size:.7rem;opacity:.5;margin-top:.1rem}
+.wrap{overflow-wrap:anywhere;word-break:break-word}
+code.wrap{display:block;white-space:pre-wrap}
 .row{display:flex;gap:.4rem;flex-wrap:wrap;margin-bottom:1.1rem}
 button{font:inherit;font-size:.82rem;border:1px solid var(--a);background:none;padding:.15rem .65rem;cursor:pointer}
 button:hover{background:color-mix(in srgb,var(--a) 12%,transparent)}
@@ -232,15 +234,15 @@ svg.ch{width:100%;height:4rem;display:block}
 <header>
   <h1>[ autoresearch ]</h1>
   <span class="st" id="st">[idle]</span>
-  <span class="dot" id="dot" title="SSE live"></span>
+  <span class="dot" id="dot" title="Live updates"></span>
   <span class="dim" style="margin-left:auto;font-size:.75rem">:${port}</span>
 </header>
 
 <div class="cards">
-  <div class="card"><div class="lbl">Goal</div><div id="goal">—</div></div>
-  <div class="card"><div class="lbl">Benchmark</div><code id="bench" style="font-size:.82rem">—</code></div>
-  <div class="card"><div class="lbl">Best Metric ★</div><div class="big" id="bv">—</div><div class="sub" id="bs"></div></div>
-  <div class="card"><div class="lbl">Session</div><div id="sid" style="font-family:monospace;font-size:.78rem">—</div><div class="sub" id="sdt"></div></div>
+  <div class="card"><div class="lbl">Goal</div><div id="goal" class="wrap">—</div></div>
+  <div class="card"><div class="lbl">Benchmark</div><code id="bench" class="wrap" style="font-size:.82rem">—</code></div>
+  <div class="card"><div class="lbl">Best Metric ★</div><div class="big" id="bv">—</div><div class="sub wrap" id="bs"></div></div>
+  <div class="card"><div class="lbl">Session</div><div id="sid" class="wrap" style="font-family:monospace;font-size:.78rem">—</div><div class="sub wrap" id="sdt"></div></div>
 </div>
 
 <div class="row">
@@ -272,6 +274,8 @@ svg.ch{width:100%;height:4rem;display:block}
 
 <script>
 let state = null;
+let es = null;
+let pollTimer = null;
 const activity = [];
 
 function ts(iso){ return iso ? new Date(iso).toLocaleTimeString() : '—'; }
@@ -336,7 +340,7 @@ function render(s) {
   const lb = document.getElementById('lb');
   const lb_bot = lb.scrollTop + lb.clientHeight >= lb.scrollHeight - 8;
   lb.innerHTML = logs.map(l =>
-    '<span class="dim">'+ts(l.at)+'</span> <span class="lv-'+x(l.level)+'">'+x(l.msg)+'</span>\n'
+    '<span class="dim">'+ts(l.at)+'</span> <span class="lv-'+x(l.level)+'">'+x(l.msg)+'</span>\\n'
   ).join('');
   if (lb_bot) lb.scrollTop = lb.scrollHeight;
 }
@@ -374,19 +378,74 @@ function renderActivity(evs) {
              : ev.toolName ? x(ev.toolName + (ev.command ? ' '+ev.command.slice(0,80) : ''))
              : ev.error ? x(String(ev.error).slice(0,200))
              : '';
-    return '<span class="dim">'+ts(ev.ts)+'</span> ['+x(ev.type)+'] '+body+'\n';
+    return '<span class="dim">'+ts(ev.ts)+'</span> ['+x(ev.type)+'] '+body+'\\n';
   }).join('') || '<span class="none">no agent activity yet</span>';
   if (was_bot) box.scrollTop = box.scrollHeight;
 }
 
 async function act(a) { try { await fetch('/api/'+a, {method:'POST'}); } catch {} }
 
+function setLive(isLive) {
+  const dot = document.getElementById('dot');
+  dot.className = isLive ? 'dot live' : 'dot';
+  dot.title = isLive ? 'Live via SSE' : 'Polling fallback';
+}
+
+async function loadSnapshot() {
+  try {
+    const res = await fetch('/api/state', { cache: 'no-store' });
+    if (!res.ok) return;
+    state = await res.json();
+    render(state);
+  } catch {}
+}
+
+async function loadActivity() {
+  try {
+    const res = await fetch('/api/activity', { cache: 'no-store' });
+    if (!res.ok) return;
+    const evs = await res.json();
+    activity.splice(0, activity.length, ...evs.slice(-100).reverse());
+    renderActivity(activity);
+  } catch {}
+}
+
+function startPolling() {
+  if (pollTimer) return;
+  pollTimer = setInterval(() => {
+    loadSnapshot();
+    loadActivity();
+  }, 5000);
+}
+
+function stopPolling() {
+  if (!pollTimer) return;
+  clearInterval(pollTimer);
+  pollTimer = null;
+}
+
 function connect() {
-  const es = new EventSource('/api/events');
-  document.getElementById('dot').className = 'dot';
-  es.onopen   = () => document.getElementById('dot').className = 'dot live';
+  if (es) es.close();
+  es = new EventSource('/api/events');
+  setLive(false);
+  const fallback = setTimeout(() => {
+    loadSnapshot();
+    loadActivity();
+    startPolling();
+  }, 1500);
+  es.onopen = () => {
+    clearTimeout(fallback);
+    stopPolling();
+    setLive(true);
+  };
   es.onmessage = e => { state = JSON.parse(e.data); render(state); };
-  es.onerror   = () => document.getElementById('dot').className = 'dot';
+  es.onerror = () => {
+    clearTimeout(fallback);
+    setLive(false);
+    loadSnapshot();
+    loadActivity();
+    startPolling();
+  };
   // Named 'copilot' events bridged from session.on() by extension.mjs.
   // New connections receive a buffer replay from the server.
   es.addEventListener('copilot', e => {
@@ -396,7 +455,12 @@ function connect() {
   });
 }
 
-connect();
+async function init() {
+  await Promise.all([loadSnapshot(), loadActivity()]);
+  connect();
+}
+
+init();
 </script>
 </body>
 </html>`;

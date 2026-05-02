@@ -276,7 +276,14 @@ test("DashboardServer serves dashboard, JSON APIs, controls, CORS, SSE, and expo
   try {
     const dashboardPage = await fetch(`${baseUrl}/`);
     assert.equal(dashboardPage.status, 200);
-    assert.match(await dashboardPage.text(), /Agent Activity/);
+    const dashboardHtml = await dashboardPage.text();
+    assert.match(dashboardHtml, /Agent Activity/);
+    assert.match(dashboardHtml, /fetch\('\/api\/state'/);
+    assert.match(dashboardHtml, /fetch\('\/api\/activity'/);
+    assert.match(dashboardHtml, /setInterval\(\(\) =>/);
+    assert.match(dashboardHtml, /\.wrap\{overflow-wrap:anywhere;word-break:break-word\}/);
+    assert.match(dashboardHtml, /id="goal" class="wrap"/);
+    assert.match(dashboardHtml, /id="bench" class="wrap"/);
 
     const stateResponse = await fetch(`${baseUrl}/api/state`, {
       headers: { Origin: baseUrl },
