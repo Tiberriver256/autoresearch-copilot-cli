@@ -28,7 +28,7 @@ const stateMgr = new StateManager(STATE_DIR);
 
 // ─── Dashboard server (lazy-started) ─────────────────────────────────────────
 
-const dashboard = new DashboardServer(stateMgr, DEFAULT_PORT);
+let dashboard = new DashboardServer(stateMgr, DEFAULT_PORT);
 let dashboardUrl = null;
 
 async function ensureDashboard() {
@@ -36,9 +36,14 @@ async function ensureDashboard() {
     try {
       dashboardUrl = await dashboard.start();
     } catch (err) {
-      // Port may already be in use — record URL anyway
-      dashboardUrl = `http://127.0.0.1:${DEFAULT_PORT}`;
-      appendLog({ event: "dashboard_start_error", error: err.message });
+      appendLog({ event: "dashboard_start_error", port: DEFAULT_PORT, error: err.message });
+
+      // A stale extension/dashboard can keep the default port busy. Do not
+      // report that stale URL as if this process owns it; fall back to an
+      // ephemeral port so this session's broadcasts reach the displayed UI.
+      dashboard = new DashboardServer(stateMgr, 0);
+      dashboardUrl = await dashboard.start();
+      appendLog({ event: "dashboard_started_ephemeral", url: dashboardUrl });
     }
   }
   return dashboardUrl;
@@ -97,6 +102,22 @@ function parseMetrics(text) {
     if (!isNaN(val)) metrics[m[1]] = val;
   }
   return metrics;
+}
+
+function extractToolResultText(toolResult) {
+  if (!toolResult) return "";
+  if (typeof toolResult === "string") return toolResult;
+  const parts = [];
+  for (const key of ["textResultForLlm", "result", "stdout", "stderr", "output", "content", "message", "error"]) {
+    const value = toolResult[key];
+    if (typeof value === "string") parts.push(value);
+  }
+  if (parts.length) return parts.join("\n");
+  try {
+    return JSON.stringify(toolResult);
+  } catch {
+    return String(toolResult);
+  }
 }
 
 // ─── Shell execution ──────────────────────────────────────────────────────────
@@ -253,6 +274,7 @@ const session = await joinSession({
         }
 
         if (sub === "init") {
+          await ensureDashboard();
           const state = readState();
           if (state.status !== "idle") {
             await session.log(`Session already initialised (status: ${state.status}). Use /autoresearch status to inspect.`, { level: "warning" });
@@ -262,17 +284,22 @@ const session = await joinSession({
           stateMgr.startSession(goal, undefined);
           appendLog({ event: "init", goal, cwd: CWD });
           updateMarkdownSummary(readState());
-          await session.log(`autoresearch session initialised${goal ? ` — goal: ${goal}` : ""}. State stored in .autoresearch/state.json`);
+          await session.log(
+            `autoresearch session initialised${goal ? ` — goal: ${goal}` : ""}. ` +
+              `Dashboard: ${dashboardUrl}. State stored in .autoresearch/state.json`
+          );
           return;
         }
 
         if (sub === "status") {
+          await ensureDashboard();
           const state = readState();
           await session.log(buildStatusSummary(state));
           return;
         }
 
         if (sub === "run") {
+          await ensureDashboard();
           const state = readState();
           const cmd = ctx.args.replace(/^run\s*/, "").trim();
           if (!cmd) {
@@ -326,8 +353,9 @@ const session = await joinSession({
         }
 
         if (sub === "server") {
+          await ensureDashboard();
           const state = readState();
-          const url = dashboardUrl || "(dashboard not started — use /autoresearch dashboard)";
+          const url = dashboardUrl;
           await session.log(
             `Server info:\n` +
             `  cwd: ${CWD}\n` +
@@ -399,6 +427,7 @@ const session = await joinSession({
         required: [],
       },
       handler: async (args) => {
+        await ensureDashboard();
         const state = readState();
         if (state.status !== "idle") {
           return {
@@ -428,7 +457,9 @@ const session = await joinSession({
         await session.log(`autoresearch initialised${goal ? ` — ${goal}` : ""}`);
         return {
           resultType: "success",
-          textResultForLlm: `Session initialised. State: ${join(STATE_DIR, "state.json")}, Log: ${LOG_FILE}, Summary: ${MD_FILE}`,
+          textResultForLlm:
+            `Session initialised. Dashboard: ${dashboardUrl}. ` +
+            `State: ${join(STATE_DIR, "state.json")}, Log: ${LOG_FILE}, Summary: ${MD_FILE}`,
         };
       },
     },
@@ -439,6 +470,7 @@ const session = await joinSession({
       description: "Return the current autoresearch session status, run count, and metrics.",
       parameters: { type: "object", properties: {}, required: [] },
       handler: async () => {
+        await ensureDashboard();
         const state = readState();
         const summary = buildStatusSummary(state);
         return { resultType: "success", textResultForLlm: summary };
@@ -464,6 +496,7 @@ const session = await joinSession({
         required: ["command"],
       },
       handler: async (args) => {
+        await ensureDashboard();
         if (!args?.command) {
           return { resultType: "failure", textResultForLlm: "command is required." };
         }
@@ -786,35 +819,33 @@ const session = await joinSession({
     },
 
     onPostToolUse: async (input) => {
+      const resultText = extractToolResultText(input.toolResult);
       // Always notify the dashboard that the tool call completed.
       dashboard.broadcastEvent('tool.end', {
         toolName: input.toolName,
         ok: input.toolResult?.resultType !== "failure",
         resultType: input.toolResult?.resultType,
+        output: resultText.slice(0, 500),
       });
 
-      // Harvest METRIC lines from any successful bash/shell output.
-      if (
-        (input.toolName === "bash" || input.toolName === "shell") &&
-        input.toolResult?.resultType === "success"
-      ) {
-        const out = String(input.toolResult?.textResultForLlm || "");
-        const metrics = parseMetrics(out);
-        if (Object.keys(metrics).length) {
-          const label = `agent_${Date.now()}`;
-          for (const [k, v] of Object.entries(metrics)) {
-            stateMgr.addMetric(`${label}/${k}`, v);
-          }
-          appendLog({ event: "metrics_from_agent_tool", tool: input.toolName, metrics });
-          dashboard.broadcastEvent('tool.metrics', { toolName: input.toolName, metrics });
-          await session.log(
-            `autoresearch captured ${Object.keys(metrics).length} metric(s) from agent ${input.toolName} output`,
-            { ephemeral: true }
-          );
-          return {
-            additionalContext: `Captured metrics: ${JSON.stringify(metrics)}`,
-          };
+      // Harvest METRIC lines from any tool output, not just shell tools. In
+      // different CLI hosts, shell execution may surface as bash, shell,
+      // powershell, or a structured custom-tool result.
+      const metrics = parseMetrics(resultText);
+      if (Object.keys(metrics).length) {
+        const label = `agent_${Date.now()}`;
+        for (const [k, v] of Object.entries(metrics)) {
+          stateMgr.addMetric(`${label}/${k}`, v);
         }
+        appendLog({ event: "metrics_from_agent_tool", tool: input.toolName, metrics });
+        dashboard.broadcastEvent('tool.metrics', { toolName: input.toolName, metrics });
+        await session.log(
+          `autoresearch captured ${Object.keys(metrics).length} metric(s) from agent ${input.toolName} output`,
+          { ephemeral: true }
+        );
+        return {
+          additionalContext: `Captured metrics: ${JSON.stringify(metrics)}`,
+        };
       }
     },
 
@@ -850,6 +881,37 @@ const session = await joinSession({
 
 // Bridge assistant messages: surface content in the activity feed and harvest
 // any METRIC name=value lines the agent may have written in its response.
+session.on("tool.execution_start", (event) => {
+  try {
+    const data = event.data || {};
+    dashboard.broadcastEvent('event.tool.start', {
+      toolName: data.toolName,
+      command: data.arguments?.command,
+    });
+  } catch { /* never throw in an event listener */ }
+});
+
+session.on("tool.execution_complete", (event) => {
+  try {
+    const data = event.data || {};
+    const resultText = extractToolResultText(data.result || data.toolResult || data);
+    dashboard.broadcastEvent('event.tool.end', {
+      toolName: data.toolName,
+      ok: data.success !== false,
+      output: resultText.slice(0, 500),
+    });
+    const metrics = parseMetrics(resultText);
+    if (Object.keys(metrics).length) {
+      const label = `event_${Date.now()}`;
+      for (const [k, v] of Object.entries(metrics)) {
+        stateMgr.addMetric(`${label}/${k}`, v);
+      }
+      appendLog({ event: "metrics_from_tool_event", tool: data.toolName, metrics });
+      dashboard.broadcastEvent('event.tool.metrics', { toolName: data.toolName, metrics });
+    }
+  } catch { /* never throw in an event listener */ }
+});
+
 session.on("assistant.message", (event) => {
   try {
     const content = event.data?.content;

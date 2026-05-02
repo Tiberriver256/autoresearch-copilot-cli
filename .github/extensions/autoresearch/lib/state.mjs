@@ -8,6 +8,7 @@ import {
   mkdirSync,
   existsSync,
   renameSync,
+  unlinkSync,
   watchFile,
   unwatchFile,
 } from 'node:fs';
@@ -59,11 +60,24 @@ export class StateManager extends EventEmitter {
     }
   }
 
-  /** Merges updates into current state and persists atomically. */
-  setState(updates) {
-    const next = { ...this.getState(), ...updates, updatedAt: new Date().toISOString() };
+  /**
+   * Merges updates into current state and persists atomically.
+   * @param {object} updates  Fields to merge into current state.
+   * @param {object|null} [logEntry]  Optional log entry to append to state.logs
+   *   in the same atomic write (avoids a separate addLog() call and write).
+   */
+  setState(updates, logEntry = null) {
+    const current = this.getState();
+    const next = { ...current, ...updates, updatedAt: new Date().toISOString() };
+    if (logEntry) {
+      const base = next.logs ?? current.logs ?? [];
+      next.logs = [...base, logEntry].slice(-MAX_LOGS);
+    }
     const tmp = this.stateFile + '.tmp';
     writeFileSync(tmp, JSON.stringify(next, null, 2), 'utf8');
+    if (process.platform === 'win32' && existsSync(this.stateFile)) {
+      unlinkSync(this.stateFile);
+    }
     renameSync(tmp, this.stateFile);
     this.emit('change', next);
     return next;
@@ -92,27 +106,27 @@ export class StateManager extends EventEmitter {
   }
 
   stopSession() {
-    this._addLogMutation('info', 'Session stopped');
-    return this.setState({ status: 'stopped', currentExperiment: null });
+    return this.setState(
+      { status: 'stopped', currentExperiment: null },
+      { at: new Date().toISOString(), level: 'info', msg: 'Session stopped' },
+    );
   }
 
   pause() {
-    this._addLogMutation('info', 'Session paused by user');
-    return this.setState({ paused: true, status: 'paused' });
+    return this.setState(
+      { paused: true, status: 'paused' },
+      { at: new Date().toISOString(), level: 'info', msg: 'Session paused by user' },
+    );
   }
 
   resume() {
-    this._addLogMutation('info', 'Session resumed by user');
-    return this.setState({ paused: false, status: 'running' });
+    return this.setState(
+      { paused: false, status: 'running' },
+      { at: new Date().toISOString(), level: 'info', msg: 'Session resumed by user' },
+    );
   }
 
   // ── Logging ────────────────────────────────────────────────────────────────
-
-  /** Prepares a log entry to append; call from within setState to avoid double-write. */
-  _addLogMutation(level, msg) {
-    // This is a direct in-memory prep; actual write handled by caller calling setState after
-    this._pendingLog = { at: new Date().toISOString(), level, msg };
-  }
 
   addLog(level, msg) {
     const current = this.getState();

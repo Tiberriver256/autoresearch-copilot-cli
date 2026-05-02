@@ -51,6 +51,6 @@ Shell commands run via PowerShell on Windows and `sh` (or `$SHELL`) on macOS/Lin
 # Syntax check
 node --check .github/extensions/autoresearch/extension.mjs
 
-# Smoke test (no CLI required)
-node scripts/smoke-test.mjs
+# Smoke test with coverage gates (no CLI required)
+npm test
 ```

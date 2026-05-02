@@ -47,6 +47,8 @@ export class DashboardServer {
         catch (err) { this._error(res, 500, err.message); }
       });
       this.server.listen(this.port, '127.0.0.1', () => {
+        const address = this.server.address();
+        if (address && typeof address === 'object') this.port = address.port;
         this.sm.on('change', this._onChange);
         // Also catch external file writes (parallel processes)
         this.sm.startWatching((state) => this._broadcast(state));
@@ -109,7 +111,11 @@ export class DashboardServer {
     const url = new URL(req.url, `http://127.0.0.1:${this.port}`);
     const p = url.pathname;
 
-    res.setHeader('Access-Control-Allow-Origin', '*');
+    const origin = req.headers.origin;
+    if (isAllowedCorsOrigin(origin, this.port)) {
+      res.setHeader('Access-Control-Allow-Origin', origin);
+      res.setHeader('Vary', 'Origin');
+    }
     res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
     res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
 
@@ -483,11 +489,36 @@ td{padding:.22rem .35rem;border-bottom:1px solid color-mix(in srgb,var(--a) 20%,
   ).join('\n') || '<span class="none">no logs</span>'
 }</div>
 
-<script>window.__AUTORESEARCH_STATE__ = ${JSON.stringify(state)};</script>
+<script>window.__AUTORESEARCH_STATE__ = ${safeJson(state)};</script>
 </body>
 </html>`;
 }
 
 function e(s) {
   return String(s ?? '—').replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function isAllowedCorsOrigin(origin, port) {
+  if (!origin) return false;
+  try {
+    const url = new URL(origin);
+    return (
+      url.protocol === 'http:' &&
+      Number(url.port || 80) === port &&
+      ['127.0.0.1', 'localhost', '[::1]'].includes(url.hostname)
+    );
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Serialises a value to JSON safe for embedding in a <script> tag.
+ * Replaces < > & so sequences like </script> or <!-- cannot escape the tag.
+ */
+function safeJson(value) {
+  return JSON.stringify(value)
+    .replace(/&/g, '\\u0026')
+    .replace(/</g, '\\u003c')
+    .replace(/>/g, '\\u003e');
 }

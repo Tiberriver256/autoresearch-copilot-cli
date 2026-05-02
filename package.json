@@ -6,7 +6,7 @@
   "private": true,
   "scripts": {
     "check": "node --check .github/extensions/autoresearch/extension.mjs",
-    "test": "node scripts/smoke-test.mjs"
+    "test": "node --experimental-test-coverage --test-coverage-include=.github/extensions/autoresearch/lib/**/*.mjs --test-coverage-lines=100 --test-coverage-branches=100 --test-coverage-functions=100 --test scripts/smoke-test.mjs"
   },
   "engines": {
     "node": ">=20"
